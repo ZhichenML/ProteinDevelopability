@@ -4,27 +4,41 @@
 # tensorboard log
 
 import os
+
 os.chdir(os.path.dirname(__file__))
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ['CUDA_VISIBLE_DEVICES']='4,6,7'
+os.environ['CUDA_VISIBLE_DEVICES']='6,7'
 
-from transformers import BertTokenizer, AutoTokenizer, BertModel, AutoModel
-from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
-from transformers import EarlyStoppingCallback
-from transformers import set_seed
-from transformers.integrations import TensorBoardCallback
-from tdc.utils import retrieve_label_name_list
-from tdc.single_pred import Develop
-from sklearn.metrics import mean_squared_error
-from tdc.utils import load as data_load
-from sklearn.model_selection import train_test_split
-from datasets import Dataset
+import numpy as np
+from datasets import Dataset, load_dataset
 from evaluate import load
-import numpy as np
-import numpy as np
-from sklearn.model_selection import StratifiedKFold, KFold
-from datasets import load_dataset
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from tdc.single_pred import Develop
+from tdc.utils import load as data_load
+from tdc.utils import retrieve_label_name_list
+from transformers import (AutoModel, AutoModelForSequenceClassification,
+                          AutoTokenizer, BertModel, BertTokenizer,
+                          EarlyStoppingCallback, Trainer, TrainingArguments,
+                          set_seed)
+from transformers.integrations import TensorBoardCallback
+from transformers.utils import logging
+logging.set_verbosity_info()
+
+from torch import nn
+from transformers import Trainer
+
+class RegressionTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.get("labels")
+        
+        outputs = model(**inputs)
+        logits = outputs.get('logits')
+        loss_fct = nn.MSELoss()
+        loss = loss_fct(logits.squeeze(), labels.squeeze())
+        return (loss, outputs) if return_outputs else loss
+
 
 set_seed(42)
 
@@ -36,8 +50,8 @@ def compute_metrics_mse(eval_pred):
 
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
-    rmse = mean_squared_error(labels, predictions, squared=False)
-    return {"rmse": rmse}
+    mse = mean_squared_error(labels, predictions, squared=True)
+    return {"mse": mse}
 
 def load_and_process_data(path='/public/home/gongzhichen/data', name = 'tap'):
     label_list = retrieve_label_name_list('TAP')
@@ -93,32 +107,31 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
     sequences, labels = load_and_process_data()
-    train_sequences, test_sequences, train_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
-    train_sequences, test_sequences, train_labels, test_labels = train_test_split(train_sequences, train_labels, test_size=0.1, shuffle=True)
+    train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
+    train_sequences, valid_sequences, train_labels, valid_labels = train_test_split(train_val_sequences, train_val_labels, test_size=0.1, shuffle=True)
     # all_fold_trainX, all_fold_trainY, all_fold_validX, all_fold_validY = Kfold_split(train_sequences, train_labels)
-
-
-    import pdb; pdb.set_trace()
-
     
     train_tokenized = tokenizer(train_sequences)
+    valid_tokenized = tokenizer(valid_sequences)
     test_tokenized = tokenizer(test_sequences)
 
-
     train_dataset = Dataset.from_dict(train_tokenized)
+    valid_dataset = Dataset.from_dict(valid_tokenized)
     test_dataset = Dataset.from_dict(test_tokenized)
     train_dataset = train_dataset.add_column("labels", train_labels)
+    valid_dataset = valid_dataset.add_column("labels", valid_labels)
     test_dataset = test_dataset.add_column("labels", test_labels)
 
-
-    model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
-                                                            num_labels=1,
-                                                            ignore_mismatched_sizes=True)
+    
 
     # set trainer arguments
     model_name = model_checkpoint.split("/")[-1]
     batch_size = len(train_dataset)
 
+    model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
+                                                            num_labels=1,
+                                                            ignore_mismatched_sizes=True)
+        
     args = TrainingArguments(
         f"{model_name}-finetuned-localization",
         evaluation_strategy = "epoch",
@@ -129,11 +142,11 @@ if __name__ == '__main__':
         num_train_epochs=400,
         weight_decay=0.01,
         load_best_model_at_end=True,
-        metric_for_best_model="rmse",
+        metric_for_best_model="mse",
         push_to_hub=False,
-        do_train= True, 
-        do_eval= True, 
-        do_predict= True, 
+        # do_train= True, 
+        # do_eval= True, 
+        # do_predict= True, 
         auto_find_batch_size= True,
         logging_dir = "./log_files/", 
         logging_strategy='epoch',
@@ -141,48 +154,69 @@ if __name__ == '__main__':
         save_total_limit=10,
         seed=42,
         greater_is_better=False,
-    )
+        )
 
 
 
-    early_stopping = EarlyStoppingCallback(early_stopping_patience= 10, 
-                                        early_stopping_threshold= 0.001,
-                                        )
+    early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
 
-    trainer = Trainer(
+    trainer = RegressionTrainer(
         model,
         args,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        eval_dataset=valid_dataset,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
         callbacks=[early_stopping,]
     )
+    
 
-    resume_from_checkpoint = None
-    last_checkpoint = None
-    checkpoint = None
-    if resume_from_checkpoint is not None:
-        checkpoint = resume_from_checkpoint
-    elif last_checkpoint is not None:
-        checkpoint = last_checkpoint
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    metrics = train_result.metrics
-
-    trainer.save_model()  # Saves the tokenizer too for easy upload
-
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
-    trainer.save_state()
-
-
-    do_eval = True
-    if do_eval:
+    do_train = False
+    if do_train:
         
-        metrics = trainer.evaluate(eval_dataset=eval_dataset)
+        
+        resume_from_checkpoint = None
+        last_checkpoint = None
+        checkpoint = None
+        if resume_from_checkpoint is not None:
+            checkpoint = resume_from_checkpoint
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
-        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+        metrics = train_result.metrics
+
+        trainer.save_model()  # Saves the tokenizer too for easy upload
+        model.save_pretrained('./output_model')
+
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+
+    
+    
+    do_eval = True
+    
+    if do_eval:
+        latest_checkpoint = '/public/home/gongzhichen/code/ProteinDevelopability/esm150m-finetuned-localization/checkpoint-89'
+        model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, 
+                                                            num_labels=1,
+                                                            ignore_mismatched_sizes=True)
+        
+        trainer = RegressionTrainer(
+            model,
+            args,
+            train_dataset=train_dataset,
+            eval_dataset=valid_dataset,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            callbacks=[early_stopping,]
+        )
+        import pdb; pdb.set_trace()
+        # metrics = trainer.evaluate(eval_dataset=test_dataset)
+        metrics = trainer.predict(test_dataset=test_dataset)
+        # max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        metrics["eval_samples"] = len(test_dataset)
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)

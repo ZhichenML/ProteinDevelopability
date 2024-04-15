@@ -13,7 +13,7 @@ os.environ['CUDA_VISIBLE_DEVICES']='6,7'
 import numpy as np
 from datasets import Dataset, load_dataset
 from evaluate import load
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, explained_variance_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from tdc.single_pred import Develop
 from tdc.utils import load as data_load
@@ -21,13 +21,17 @@ from tdc.utils import retrieve_label_name_list
 from transformers import (AutoModel, AutoModelForSequenceClassification,
                           AutoTokenizer, BertModel, BertTokenizer,
                           EarlyStoppingCallback, Trainer, TrainingArguments,
-                          set_seed)
+                          set_seed, AutoConfig)
 from transformers.integrations import TensorBoardCallback
 from transformers.utils import logging
-logging.set_verbosity_info()
+logging.set_verbosity_debug()
+logger = logging.get_logger(__name__)
 
+import torch
 from torch import nn
 from transformers import Trainer
+
+set_seed(42)
 
 class RegressionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -38,20 +42,25 @@ class RegressionTrainer(Trainer):
         loss_fct = nn.MSELoss()
         loss = loss_fct(logits.squeeze(), labels.squeeze())
         return (loss, outputs) if return_outputs else loss
+    
+    
 
 
-set_seed(42)
 
-metric = load("mse")
 
 def compute_metrics_mse(eval_pred):
+    metric = load("mse")
+    r2 = load("r2")
     predictions, labels = eval_pred
     return metric.compute(predictions=predictions, references=labels)
 
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     mse = mean_squared_error(labels, predictions, squared=True)
-    return {"mse": mse}
+    r2 = r2_score(labels, predictions)
+    mae = mean_absolute_error(labels, predictions)
+    evs = explained_variance_score(labels, predictions)
+    return {"mse": mse, 'r2': r2,'mae': mae, 'evs': evs}
 
 def load_and_process_data(path='/public/home/gongzhichen/data', name = 'tap'):
     label_list = retrieve_label_name_list('TAP')
@@ -102,6 +111,53 @@ def Kfold_split(train_sequences, train_labels):
     return all_fold_trainX, all_fold_trainY, all_fold_validX, all_fold_validY
 
 
+class develop_esm(nn.Module):
+    def __init__(self, cfg, config_path=None, pretrained_path=None, dropout_rate=0.2, fc_hidden_size=768, use_keras_init=False, use_pooling=True):
+        super(develop_esm,self).__init__()
+        self.cfg=cfg
+        if config_path is None:
+            self.config = AutoConfig.from_pretrained(cfg.model,output_hidden_states=True)
+        else:
+            self.config = torch.load(config_path)
+        if pretrained_path is None:
+            self.pretrained_model = AutoModel.from_pretrained(cfg.model,config=self.config)
+        else:
+            self.pretrained_model = AutoModel.from_pretrained(pretrained_path)
+        self.fc_dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(fc_hidden_size,1)
+        if use_keras_init:
+          self._init_weights(self.fc)
+        self.use_pooling=use_pooling
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            #module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            module.weight.data=torch.nn.init.xavier_uniform(module.weight.data)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+            
+                    
+    def forward(self,inputs): ##直接传入字典不需要其它的
+        # inputs的输入为x，不要包含标签
+        #dt=inputs.get('inputs')
+        for key in inputs.keys():
+          inputs[key].squeeze_(1)
+        
+        #outputs=self.pretrained_model(inputs.get('input_ids').squeeze(1),inputs.get('attention_mask').squeeze(1),inputs.get('token_type_ids').squeeze(1),position_ids=inputs.get('position_ids'),return_dict=True)
+        outputs=self.pretrained_model(**inputs,return_dict=True)
+        if self.use_pooling:
+          preds=self.fc(self.fc_dropout(torch.mean(outputs.get('last_hidden_state'),1))) ## use only cls hidden states
+        else:
+          preds=self.fc(self.fc_dropout(outputs.get('pooler_output')))
+        return preds
+
 if __name__ == '__main__':
     model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
@@ -128,51 +184,52 @@ if __name__ == '__main__':
     model_name = model_checkpoint.split("/")[-1]
     batch_size = len(train_dataset)
 
-    model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
-                                                            num_labels=1,
-                                                            ignore_mismatched_sizes=True)
-        
-    args = TrainingArguments(
-        f"{model_name}-finetuned-localization",
-        evaluation_strategy = "epoch",
-        save_strategy = "epoch",
-        learning_rate=2e-5,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        num_train_epochs=400,
-        weight_decay=0.01,
-        load_best_model_at_end=True,
-        metric_for_best_model="mse",
-        push_to_hub=False,
-        # do_train= True, 
-        # do_eval= True, 
-        # do_predict= True, 
-        auto_find_batch_size= True,
-        logging_dir = "./log_files/", 
-        logging_strategy='epoch',
-        group_by_length = True,
-        save_total_limit=10,
-        seed=42,
-        greater_is_better=False,
-        )
-
-
-
-    early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
-
-    trainer = RegressionTrainer(
-        model,
-        args,
-        train_dataset=train_dataset,
-        eval_dataset=valid_dataset,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
-        callbacks=[early_stopping,]
-    )
+    
     
 
     do_train = False
     if do_train:
+        model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
+                                                            num_labels=1,
+                                                            ignore_mismatched_sizes=True)
+        
+        args = TrainingArguments(
+            f"{model_name}-finetuned-localization",
+            evaluation_strategy = "epoch",
+            save_strategy = "epoch",
+            learning_rate=2e-5,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            num_train_epochs=400,
+            weight_decay=0.01,
+            load_best_model_at_end=True,
+            metric_for_best_model="mse",
+            push_to_hub=False,
+            # do_train= True, 
+            # do_eval= True, 
+            # do_predict= True, 
+            auto_find_batch_size= True,
+            logging_dir = "./log_files/", 
+            logging_strategy='epoch',
+            group_by_length = True,
+            save_total_limit=10,
+            seed=42,
+            greater_is_better=False,
+            )
+
+
+
+        early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
+
+        trainer = RegressionTrainer(
+            model,
+            args,
+            train_dataset=train_dataset,
+            eval_dataset=valid_dataset,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            callbacks=[early_stopping,]
+        )
         
         
         resume_from_checkpoint = None
@@ -202,7 +259,37 @@ if __name__ == '__main__':
         model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, 
                                                             num_labels=1,
                                                             ignore_mismatched_sizes=True)
+        import pdb; pdb.set_trace()
         
+        
+        args = TrainingArguments(
+            f"{model_name}-finetuned-localization",
+            evaluation_strategy = "epoch",
+            save_strategy = "epoch",
+            learning_rate=2e-5,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            num_train_epochs=400,
+            weight_decay=0.01,
+            load_best_model_at_end=True,
+            metric_for_best_model="mse",
+            push_to_hub=False,
+            # do_train= True, 
+            # do_eval= True, 
+            # do_predict= True, 
+            auto_find_batch_size= True,
+            logging_dir = "./log_files/", 
+            logging_strategy='epoch',
+            group_by_length = True,
+            save_total_limit=10,
+            seed=42,
+            greater_is_better=False,
+            )
+
+
+
+        early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
+
         trainer = RegressionTrainer(
             model,
             args,
@@ -212,14 +299,16 @@ if __name__ == '__main__':
             compute_metrics=compute_metrics,
             callbacks=[early_stopping,]
         )
-        import pdb; pdb.set_trace()
+        
         # metrics = trainer.evaluate(eval_dataset=test_dataset)
-        metrics = trainer.predict(test_dataset=test_dataset)
-        # max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = len(test_dataset)
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+        # # max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        # metrics["eval_samples"] = len(test_dataset)
+        # trainer.log_metrics("eval", metrics)
+        # trainer.save_metrics("eval", metrics)
+        
+        predictions = trainer.predict(test_dataset=test_dataset)
+        print(predictions)
+        
 
     # Prediction
     # if training_args.do_predict:

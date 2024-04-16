@@ -1,4 +1,4 @@
 # Todo
-1. custom model in trainer
+1. custom model in trainer (Done) 
 2. visualize train-validation-test loss during training (maybe by callback)
 3. compare test prediction and actual values (Done)

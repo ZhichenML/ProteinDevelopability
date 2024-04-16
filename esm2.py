@@ -23,6 +23,7 @@ from transformers import (AutoModel, AutoModelForSequenceClassification,
                           EarlyStoppingCallback, Trainer, TrainingArguments,
                           set_seed, AutoConfig)
 from transformers.integrations import TensorBoardCallback
+from transformers.modeling_outputs import TokenClassifierOutput
 from transformers.utils import logging
 logging.set_verbosity_debug()
 logger = logging.get_logger(__name__)
@@ -37,13 +38,17 @@ class RegressionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.get("labels")
         
+        outputs=model(inputs.get('input_ids'),inputs.get('attention_mask'),inputs.get('labels'))
+        
         outputs = model(**inputs)
+        
         logits = outputs.get('logits')
         loss_fct = nn.MSELoss()
-        loss = loss_fct(logits.squeeze(), labels.squeeze())
+        
+        loss = loss_fct(logits, labels)
         return (loss, outputs) if return_outputs else loss
     
-    
+        
 
 
 
@@ -112,19 +117,28 @@ def Kfold_split(train_sequences, train_labels):
 
 
 class develop_esm(nn.Module):
-    def __init__(self, cfg, config_path=None, pretrained_path=None, dropout_rate=0.2, fc_hidden_size=768, use_keras_init=False, use_pooling=True):
+    def __init__(self, cfg, config_path=None, pretrained_path=None, dropout_rate=0.2, fc_hidden_size=640, use_keras_init=True, use_pooling=False, freeze_pretrained=True):
         super(develop_esm,self).__init__()
-        self.cfg=cfg
-        if config_path is None:
-            self.config = AutoConfig.from_pretrained(cfg.model,output_hidden_states=True)
-        else:
-            self.config = torch.load(config_path)
-        if pretrained_path is None:
-            self.pretrained_model = AutoModel.from_pretrained(cfg.model,config=self.config)
-        else:
-            self.pretrained_model = AutoModel.from_pretrained(pretrained_path)
+        # self.cfg=cfg
+        # if config_path is None:
+        #     self.config = AutoConfig.from_pretrained(cfg.model,output_hidden_states=True)
+        # else:
+        #     self.config = torch.load(config_path)
+        # if pretrained_path is None:
+        #     self.pretrained_model = AutoModel.from_pretrained(cfg.model,config=self.config)
+        # else:
+        self.pretrained_model = AutoModel.from_pretrained(pretrained_path, 
+                                                          config=AutoConfig.from_pretrained(pretrained_path),
+                                                          )
+        if freeze_pretrained:
+            for param in self.pretrained_model.parameters():
+                param.requires_grad = False
+        self.dropout_rate = dropout_rate
         self.fc_dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(fc_hidden_size,1)
+        hidden_size = int(fc_hidden_size/10)
+        self.fc = nn.Linear(fc_hidden_size, hidden_size)
+        self.fc_out = nn.Linear(hidden_size, 1)
+        self.activation = nn.ReLU()
         if use_keras_init:
           self._init_weights(self.fc)
         self.use_pooling=use_pooling
@@ -143,20 +157,50 @@ class develop_esm(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
             
-                    
-    def forward(self,inputs): ##直接传入字典不需要其它的
+    def forward(self,input_ids, attention_mask, labels=None): ##直接传入字典不需要其它的
+        # inputs的输入为x，不要包含标签
+        #dt=inputs.get('inputs')
+        
+        # import pdb;pdb.set_trace()
+        outputs=self.pretrained_model(input_ids, attention_mask,return_dict=True)
+        # outputs=self.pretrained_model(**inputs, return_dict=True)
+        if self.use_pooling:
+          # use only cls hidden states
+        #   preds=self.fc(self.fc_dropout(outputs.get('last_hidden_state')[:,0,:]))
+          preds=self.fc_out(self.activation(self.fc(self.fc_dropout(torch.mean(outputs.get('last_hidden_state'), 1))))) 
+        else:
+        #   import pdb;pdb.set_trace()
+          x = outputs.get('pooler_output')
+          x = self.activation(self.fc(self.fc_dropout(x)))
+          preds=self.fc_out(x)
+        loss = None
+        if labels is not None:
+            
+            loss_fct = nn.MSELoss()
+            loss = loss_fct(preds.squeeze(), labels.squeeze())
+        return TokenClassifierOutput(loss=loss,logits=preds, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+        
+    def forward_(self,inputs): ##直接传入字典不需要其它的
         # inputs的输入为x，不要包含标签
         #dt=inputs.get('inputs')
         for key in inputs.keys():
           inputs[key].squeeze_(1)
         
-        #outputs=self.pretrained_model(inputs.get('input_ids').squeeze(1),inputs.get('attention_mask').squeeze(1),inputs.get('token_type_ids').squeeze(1),position_ids=inputs.get('position_ids'),return_dict=True)
-        outputs=self.pretrained_model(**inputs,return_dict=True)
+        outputs=self.pretrained_model(inputs.get('input_ids').squeeze(1),inputs.get('attention_mask').squeeze(1),inputs.get('token_type_ids').squeeze(1),position_ids=inputs.get('position_ids'),return_dict=True)
+        # outputs=self.pretrained_model(**inputs, return_dict=True)
         if self.use_pooling:
-          preds=self.fc(self.fc_dropout(torch.mean(outputs.get('last_hidden_state'),1))) ## use only cls hidden states
+          # use only cls hidden states
+        #   preds=self.fc(self.fc_dropout(outputs.get('last_hidden_state')[:,0,:]))
+          preds=self.fc_out(self.activation(self.fc(self.fc_dropout(torch.mean(outputs.get('last_hidden_state'), 1))))) 
         else:
-          preds=self.fc(self.fc_dropout(outputs.get('pooler_output')))
+          preds=self.fc_out(self.activation(self.fc(self.fc_dropout(outputs.get('pooler_output')))))
+        
+        if inputs.get('labels') is not None:
+            labels=inputs.get('labels').squeeze(1)
+            loss_fct = nn.MSELoss()
+            loss = loss_fct(preds.squeeze(), labels.squeeze())
         return preds
+
 
 if __name__ == '__main__':
     model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
@@ -179,7 +223,7 @@ if __name__ == '__main__':
     test_dataset = test_dataset.add_column("labels", test_labels)
 
     
-
+    
     # set trainer arguments
     model_name = model_checkpoint.split("/")[-1]
     batch_size = len(train_dataset)
@@ -187,17 +231,18 @@ if __name__ == '__main__':
     
     
 
-    do_train = False
+    do_train = True
     if do_train:
-        model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
-                                                            num_labels=1,
-                                                            ignore_mismatched_sizes=True)
+        # model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
+        #                                                     num_labels=1,
+        #                                                     ignore_mismatched_sizes=True)
         
+        model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
         args = TrainingArguments(
             f"{model_name}-finetuned-localization",
             evaluation_strategy = "epoch",
             save_strategy = "epoch",
-            learning_rate=2e-5,
+            learning_rate=1e-5,
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=batch_size,
             num_train_epochs=400,
@@ -205,9 +250,6 @@ if __name__ == '__main__':
             load_best_model_at_end=True,
             metric_for_best_model="mse",
             push_to_hub=False,
-            # do_train= True, 
-            # do_eval= True, 
-            # do_predict= True, 
             auto_find_batch_size= True,
             logging_dir = "./log_files/", 
             logging_strategy='epoch',
@@ -215,6 +257,7 @@ if __name__ == '__main__':
             save_total_limit=10,
             seed=42,
             greater_is_better=False,
+            remove_unused_columns=False,
             )
 
 
@@ -252,21 +295,19 @@ if __name__ == '__main__':
 
     
     
-    do_eval = True
+    do_eval = False
     
     if do_eval:
         latest_checkpoint = '/public/home/gongzhichen/code/ProteinDevelopability/esm150m-finetuned-localization/checkpoint-89'
-        model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, 
-                                                            num_labels=1,
-                                                            ignore_mismatched_sizes=True)
-        import pdb; pdb.set_trace()
+        model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, num_labels=1, ignore_mismatched_sizes=True)
         
+        # model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
         
         args = TrainingArguments(
             f"{model_name}-finetuned-localization",
             evaluation_strategy = "epoch",
             save_strategy = "epoch",
-            learning_rate=2e-5,
+            learning_rate=2e-5, 
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=batch_size,
             num_train_epochs=400,
@@ -284,6 +325,7 @@ if __name__ == '__main__':
             save_total_limit=10,
             seed=42,
             greater_is_better=False,
+            remove_unused_columns=True,
             )
 
 

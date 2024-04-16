@@ -161,6 +161,7 @@ class develop_esm(nn.Module):
         # inputs的输入为x，不要包含标签
         
         outputs=self.pretrained_model(input_ids, attention_mask,return_dict=True)
+        # import pdb; pdb.set_trace() 
         # outputs=self.pretrained_model(**inputs, return_dict=True)
         if self.use_pooling:
           # use only cls hidden states
@@ -177,198 +178,230 @@ class develop_esm(nn.Module):
             loss = loss_fct(preds.squeeze(), labels.squeeze())
         return TokenClassifierOutput(loss=loss,logits=preds, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
         
-    def forward_(self,inputs): ##直接传入字典不需要其它的
-        # inputs的输入为x，不要包含标签
-        #dt=inputs.get('inputs')
-        for key in inputs.keys():
-          inputs[key].squeeze_(1)
+class get_esm_output():
+    def __init__(self, model_checkpoint):
+        self.model_checkpoint = model_checkpoint
+        self.pretrained_model = AutoModel.from_pretrained(model_checkpoint, 
+                                                          config=AutoConfig.from_pretrained(model_checkpoint),
+                                                          )
+        self.tokenizer_ = AutoTokenizer.from_pretrained(model_checkpoint)
+
         
-        outputs=self.pretrained_model(inputs.get('input_ids').squeeze(1),inputs.get('attention_mask').squeeze(1),inputs.get('token_type_ids').squeeze(1),position_ids=inputs.get('position_ids'),return_dict=True)
-        # outputs=self.pretrained_model(**inputs, return_dict=True)
-        if self.use_pooling:
-          # use only cls hidden states
-        #   preds=self.fc(self.fc_dropout(outputs.get('last_hidden_state')[:,0,:]))
-          preds=self.fc_out(self.activation(self.fc(self.fc_dropout(torch.mean(outputs.get('last_hidden_state'), 1))))) 
-        else:
-          preds=self.fc_out(self.activation(self.fc(self.fc_dropout(outputs.get('pooler_output')))))
+    # def call(self, inputs): ##直接传入字典不需要其它的
+    #     # inputs的输入为x，不要包含标签
+    #     import pdb; pdb.set_trace()
         
-        if inputs.get('labels') is not None:
-            labels=inputs.get('labels').squeeze(1)
-            loss_fct = nn.MSELoss()
-            loss = loss_fct(preds.squeeze(), labels.squeeze())
-        return preds
+    #     outputs=self.pretrained_model(inputs.data['input_ids'],inputs.data['attention_mask'], return_dict=True)
+    #     ret = outputs.get('pooler_output')
+    #     return ret
+    def transform(self, train_sequences, valid_sequences, test_sequences, train_labels, valid_labels, test_labels):
+        
+        train_embedding = self.get(train_sequences)
+        valid_embedding = self.get(valid_sequences)
+        test_embedding = self.get(test_sequences)
+        tap = {'train_X': train_embedding, 'train_Y': train_labels, 'valid_X': valid_embedding, 'valid_Y': valid_labels, 'test_X': test_embedding, 'test_Y': test_labels}
+        np.savez('/public/home/gongzhichen/code/data/tap.npz', **tap)
+
+    def get(self, seq_list):
+        ret = []        
+        for seq in seq_list:
+            token_seq = self.tokenizer_(seq, return_tensors='pt')
+            outputs_ = self.pretrained_model(**token_seq)
+            ret.append(outputs_.last_hidden_state[:,0,:].detach().numpy().squeeze())  ##这是获取得到的 cls 蛋白整体代表的向量
+        return np.array(ret)
+    
+class funcs():
+    def __init__(self):
+        pass
+    def get_embedding(self):
+        model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
+        sequences, labels = load_and_process_data()
+        
+        train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
+        train_sequences, valid_sequences, train_labels, valid_labels = train_test_split(train_val_sequences, train_val_labels, test_size=0.1, shuffle=True)
+
+        generator = get_esm_output(model_checkpoint)
+        generator.transform(train_sequences, valid_sequences, test_sequences, train_labels, valid_labels, test_labels)
+        
+    def train_pipeline(self):
+        model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
+        tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+
+        sequences, labels = load_and_process_data()
+        
+        train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
+        train_sequences, valid_sequences, train_labels, valid_labels = train_test_split(train_val_sequences, train_val_labels, test_size=0.1, shuffle=True)
+        # all_fold_trainX, all_fold_trainY, all_fold_validX, all_fold_validY = Kfold_split(train_sequences, train_labels)
+        
+        train_tokenized = tokenizer(train_sequences)
+        valid_tokenized = tokenizer(valid_sequences)
+        test_tokenized = tokenizer(test_sequences)
+
+        train_dataset = Dataset.from_dict(train_tokenized)
+        valid_dataset = Dataset.from_dict(valid_tokenized)
+        test_dataset = Dataset.from_dict(test_tokenized)
+        train_dataset = train_dataset.add_column("labels", train_labels)
+        valid_dataset = valid_dataset.add_column("labels", valid_labels)
+        test_dataset = test_dataset.add_column("labels", test_labels)
+
+        
+        
+        # set trainer arguments
+        model_name = model_checkpoint.split("/")[-1]
+        batch_size = len(train_dataset)
+
+        
+        do_train = False
+        do_eval = False
+        
+        
+        
+
+        if do_train:
+            # model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
+            #                                                     num_labels=1,
+            #                                                     ignore_mismatched_sizes=True)
+            
+            model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
+            args = TrainingArguments(
+                f"{model_name}-finetuned-localization",
+                evaluation_strategy = "epoch",
+                save_strategy = "epoch",
+                learning_rate=1e-5,
+                per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=batch_size,
+                num_train_epochs=400,
+                weight_decay=0.01,
+                load_best_model_at_end=True,
+                metric_for_best_model="mae",
+                push_to_hub=False,
+                auto_find_batch_size= False,
+                logging_dir = "./log_files/", 
+                logging_strategy='epoch',
+                group_by_length = True,
+                save_total_limit=10,
+                seed=42,
+                greater_is_better=False,
+                remove_unused_columns=False,
+                )
+
+
+
+            early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
+
+            trainer = RegressionTrainer(
+                model,
+                args,
+                train_dataset=train_dataset,
+                eval_dataset=valid_dataset,
+                tokenizer=tokenizer,
+                compute_metrics=compute_metrics,
+                callbacks=[early_stopping,]
+            )
+            
+            
+            resume_from_checkpoint = None
+            last_checkpoint = None
+            checkpoint = None
+            if resume_from_checkpoint is not None:
+                checkpoint = resume_from_checkpoint
+            elif last_checkpoint is not None:
+                checkpoint = last_checkpoint
+            train_result = trainer.train(resume_from_checkpoint=checkpoint)
+
+            metrics = train_result.metrics
+
+            trainer.save_model()  # Saves the tokenizer too for easy upload
+            model.save_pretrained('./output_model')
+
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+            trainer.save_state()
+
+        
+        
+        
+        
+        if do_eval:
+            latest_checkpoint = '/public/home/gongzhichen/code/ProteinDevelopability/esm150m-finetuned-localization/checkpoint-89'
+            model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, num_labels=1, ignore_mismatched_sizes=True)
+            
+            # model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
+            
+            args = TrainingArguments(
+                f"{model_name}-finetuned-localization",
+                evaluation_strategy = "epoch",
+                save_strategy = "epoch",
+                learning_rate=2e-5, 
+                per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=batch_size,
+                num_train_epochs=400,
+                weight_decay=0.01,
+                load_best_model_at_end=True,
+                metric_for_best_model="mse",
+                push_to_hub=False,
+                # do_train= True, 
+                # do_eval= True, 
+                # do_predict= True, 
+                auto_find_batch_size= True,
+                logging_dir = "./log_files/", 
+                logging_strategy='epoch',
+                group_by_length = True,
+                save_total_limit=10,
+                seed=42,
+                greater_is_better=False,
+                remove_unused_columns=True,
+                )
+
+
+
+            early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
+
+            trainer = RegressionTrainer(
+                model,
+                args,
+                train_dataset=train_dataset,
+                eval_dataset=valid_dataset,
+                tokenizer=tokenizer,
+                compute_metrics=compute_metrics,
+                callbacks=[early_stopping,]
+            )
+            
+            # metrics = trainer.evaluate(eval_dataset=test_dataset)
+            # # max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+            # metrics["eval_samples"] = len(test_dataset)
+            # trainer.log_metrics("eval", metrics)
+            # trainer.save_metrics("eval", metrics)
+            
+            predictions = trainer.predict(test_dataset=test_dataset)
+            print(predictions)
+            
+
+        # Prediction
+        # if training_args.do_predict:
+        #     logger.info("*** Predict ***")
+        #     predictions, labels, metrics = trainer.predict(predict_dataset, metric_key_prefix="predict")
+
+        #     max_predict_samples = (
+        #         data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
+        #     )
+        #     metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
+
+        #     trainer.log_metrics("predict", metrics)
+        #     trainer.save_metrics("predict", metrics)
+
+        #     predictions = np.argmax(predictions, axis=1)
+        #     output_predict_file = os.path.join(training_args.output_dir, "predictions.txt")
+        #     if trainer.is_world_process_zero():
+        #         with open(output_predict_file, "w") as writer:
+        #             writer.write("index\tprediction\n")
+        #             for index, item in enumerate(predictions):
+        #                 item = label_list[item]
+        #                 writer.write(f"{index}\t{item}\n")
 
 
 if __name__ == '__main__':
-    model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
-    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-
-    sequences, labels = load_and_process_data()
-    train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
-    train_sequences, valid_sequences, train_labels, valid_labels = train_test_split(train_val_sequences, train_val_labels, test_size=0.1, shuffle=True)
-    # all_fold_trainX, all_fold_trainY, all_fold_validX, all_fold_validY = Kfold_split(train_sequences, train_labels)
+    can_do = funcs()
+    can_do.get_embedding()
     
-    train_tokenized = tokenizer(train_sequences)
-    valid_tokenized = tokenizer(valid_sequences)
-    test_tokenized = tokenizer(test_sequences)
-
-    train_dataset = Dataset.from_dict(train_tokenized)
-    valid_dataset = Dataset.from_dict(valid_tokenized)
-    test_dataset = Dataset.from_dict(test_tokenized)
-    train_dataset = train_dataset.add_column("labels", train_labels)
-    valid_dataset = valid_dataset.add_column("labels", valid_labels)
-    test_dataset = test_dataset.add_column("labels", test_labels)
-
-    
-    
-    # set trainer arguments
-    model_name = model_checkpoint.split("/")[-1]
-    batch_size = len(train_dataset)
-
-    
-    
-
-    do_train = True
-    if do_train:
-        # model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, 
-        #                                                     num_labels=1,
-        #                                                     ignore_mismatched_sizes=True)
-        
-        model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
-        args = TrainingArguments(
-            f"{model_name}-finetuned-localization",
-            evaluation_strategy = "epoch",
-            save_strategy = "epoch",
-            learning_rate=1e-5,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            num_train_epochs=400,
-            weight_decay=0.01,
-            load_best_model_at_end=True,
-            metric_for_best_model="mse",
-            push_to_hub=False,
-            auto_find_batch_size= True,
-            logging_dir = "./log_files/", 
-            logging_strategy='epoch',
-            group_by_length = True,
-            save_total_limit=10,
-            seed=42,
-            greater_is_better=False,
-            remove_unused_columns=False,
-            )
-
-
-
-        early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
-
-        trainer = RegressionTrainer(
-            model,
-            args,
-            train_dataset=train_dataset,
-            eval_dataset=valid_dataset,
-            tokenizer=tokenizer,
-            compute_metrics=compute_metrics,
-            callbacks=[early_stopping,]
-        )
-        
-        
-        resume_from_checkpoint = None
-        last_checkpoint = None
-        checkpoint = None
-        if resume_from_checkpoint is not None:
-            checkpoint = resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-
-        metrics = train_result.metrics
-
-        trainer.save_model()  # Saves the tokenizer too for easy upload
-        model.save_pretrained('./output_model')
-
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-
-    
-    
-    do_eval = False
-    
-    if do_eval:
-        latest_checkpoint = '/public/home/gongzhichen/code/ProteinDevelopability/esm150m-finetuned-localization/checkpoint-89'
-        model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, num_labels=1, ignore_mismatched_sizes=True)
-        
-        # model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
-        
-        args = TrainingArguments(
-            f"{model_name}-finetuned-localization",
-            evaluation_strategy = "epoch",
-            save_strategy = "epoch",
-            learning_rate=2e-5, 
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            num_train_epochs=400,
-            weight_decay=0.01,
-            load_best_model_at_end=True,
-            metric_for_best_model="mse",
-            push_to_hub=False,
-            # do_train= True, 
-            # do_eval= True, 
-            # do_predict= True, 
-            auto_find_batch_size= True,
-            logging_dir = "./log_files/", 
-            logging_strategy='epoch',
-            group_by_length = True,
-            save_total_limit=10,
-            seed=42,
-            greater_is_better=False,
-            remove_unused_columns=True,
-            )
-
-
-
-        early_stopping = EarlyStoppingCallback(early_stopping_patience= 10)
-
-        trainer = RegressionTrainer(
-            model,
-            args,
-            train_dataset=train_dataset,
-            eval_dataset=valid_dataset,
-            tokenizer=tokenizer,
-            compute_metrics=compute_metrics,
-            callbacks=[early_stopping,]
-        )
-        
-        # metrics = trainer.evaluate(eval_dataset=test_dataset)
-        # # max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        # metrics["eval_samples"] = len(test_dataset)
-        # trainer.log_metrics("eval", metrics)
-        # trainer.save_metrics("eval", metrics)
-        
-        predictions = trainer.predict(test_dataset=test_dataset)
-        print(predictions)
-        
-
-    # Prediction
-    # if training_args.do_predict:
-    #     logger.info("*** Predict ***")
-    #     predictions, labels, metrics = trainer.predict(predict_dataset, metric_key_prefix="predict")
-
-    #     max_predict_samples = (
-    #         data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
-    #     )
-    #     metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
-
-    #     trainer.log_metrics("predict", metrics)
-    #     trainer.save_metrics("predict", metrics)
-
-    #     predictions = np.argmax(predictions, axis=1)
-    #     output_predict_file = os.path.join(training_args.output_dir, "predictions.txt")
-    #     if trainer.is_world_process_zero():
-    #         with open(output_predict_file, "w") as writer:
-    #             writer.write("index\tprediction\n")
-    #             for index, item in enumerate(predictions):
-    #                 item = label_list[item]
-    #                 writer.write(f"{index}\t{item}\n")
-
-
+    # can_do.train_pipeline()

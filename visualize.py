@@ -24,7 +24,9 @@ if __name__ == '__main__':
     train_X, valid_X, test_X, train_y, valid_y, test_y = data['train_X'], data['valid_X'], data['test_X'], data['train_Y'], data['valid_Y'], data['test_Y']
 
     x_std = StandardScaler().fit_transform(np.concatenate((train_X, valid_X, test_X), axis=0))
-    x_pca = PCA(n_components=2).fit_transform(x_std)
+    pca = PCA(n_components=2)
+    x_pca = pca.fit_transform(x_std)
+    
 
     X_pca = np.vstack((x_pca.T, np.concatenate((train_y, valid_y, test_y), axis=0))).T
     X_pca = pd.DataFrame(X_pca, columns=['PC1', 'PC2', 'label'])
@@ -32,7 +34,7 @@ if __name__ == '__main__':
     # visualize PCA
     plt.figure(figsize=(10, 10))
     plt.scatter(x_pca[:, 0], x_pca[:, 1], c=np.concatenate((train_y, valid_y, test_y), axis=0))
-    plt.title('PCA')
+    plt.title(f'PCA {pca.explained_variance_ratio_}')
     plt.colorbar()
     plt.show()
     plt.savefig('./figures/PCA.png')

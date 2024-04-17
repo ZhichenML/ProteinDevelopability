@@ -21,7 +21,7 @@ from tdc.utils import retrieve_label_name_list
 from transformers import (AutoModel, AutoModelForSequenceClassification,
                           AutoTokenizer, BertModel, BertTokenizer,
                           EarlyStoppingCallback, Trainer, TrainingArguments,
-                          set_seed, AutoConfig)
+                          set_seed, AutoConfig, PreTrainedModel)
 from transformers.integrations import TensorBoardCallback
 from transformers.modeling_outputs import TokenClassifierOutput
 from transformers.utils import logging
@@ -85,7 +85,8 @@ def load_and_process_data(path='/public/home/gongzhichen/data', name = 'tap'):
         df.loc[ind,'X'] = v
     
     sequences = df['X'].tolist()
-    labels = df[label_list[-1]].tolist()
+    labels = df[label_list[0]].tolist()
+    labels = [float(v) for v in labels]
     assert len(sequences) == len(labels)
 
     
@@ -185,15 +186,12 @@ class get_esm_output():
                                                           config=AutoConfig.from_pretrained(model_checkpoint),
                                                           )
         self.tokenizer_ = AutoTokenizer.from_pretrained(model_checkpoint)
-
+    
+    def transform_all(self, sequences, labels):
+        embedding = self.get(sequences)
+        tap = {'X': embedding, 'Y': labels}
+        np.savez('/public/home/gongzhichen/code/data/tap_nosplit.npz', **tap)
         
-    # def call(self, inputs): ##直接传入字典不需要其它的
-    #     # inputs的输入为x，不要包含标签
-    #     import pdb; pdb.set_trace()
-        
-    #     outputs=self.pretrained_model(inputs.data['input_ids'],inputs.data['attention_mask'], return_dict=True)
-    #     ret = outputs.get('pooler_output')
-    #     return ret
     def transform(self, train_sequences, valid_sequences, test_sequences, train_labels, valid_labels, test_labels):
         
         train_embedding = self.get(train_sequences)
@@ -201,7 +199,7 @@ class get_esm_output():
         test_embedding = self.get(test_sequences)
         tap = {'train_X': train_embedding, 'train_Y': train_labels, 'valid_X': valid_embedding, 'valid_Y': valid_labels, 'test_X': test_embedding, 'test_Y': test_labels}
         np.savez('/public/home/gongzhichen/code/data/tap.npz', **tap)
-
+    
     def get(self, seq_list):
         ret = []        
         for seq in seq_list:
@@ -213,8 +211,16 @@ class get_esm_output():
 class funcs():
     def __init__(self):
         pass
+
+    def get_embedding_all(self):
+        model_checkpoint = '/public/home/gongzhichen/hf_models/esm3b'
+        sequences, labels = load_and_process_data()
+
+        generator = get_esm_output(model_checkpoint)
+        generator.transform_all(sequences, labels)
+
     def get_embedding(self):
-        model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
+        model_checkpoint = '/public/home/gongzhichen/hf_models/esm3b'
         sequences, labels = load_and_process_data()
         
         train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
@@ -224,7 +230,7 @@ class funcs():
         generator.transform(train_sequences, valid_sequences, test_sequences, train_labels, valid_labels, test_labels)
         
     def train_pipeline(self):
-        model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
+        model_checkpoint = '/public/home/gongzhichen/hf_models/esm3b'
         tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
         sequences, labels = load_and_process_data()
@@ -251,8 +257,8 @@ class funcs():
         batch_size = len(train_dataset)
 
         
-        do_train = False
-        do_eval = False
+        do_train = True
+        do_eval = True
         
         
         
@@ -267,10 +273,10 @@ class funcs():
                 f"{model_name}-finetuned-localization",
                 evaluation_strategy = "epoch",
                 save_strategy = "epoch",
-                learning_rate=1e-5,
+                learning_rate=2e-5,
                 per_device_train_batch_size=batch_size,
                 per_device_eval_batch_size=batch_size,
-                num_train_epochs=400,
+                num_train_epochs=500,
                 weight_decay=0.01,
                 load_best_model_at_end=True,
                 metric_for_best_model="mae",
@@ -312,7 +318,8 @@ class funcs():
             metrics = train_result.metrics
 
             trainer.save_model()  # Saves the tokenizer too for easy upload
-            model.save_pretrained('./output_model')
+            # model.save_pretrained('./output_model')
+            torch.save(model.state_dict(), f'{model_name}-finetuned-localization/pytorch_model.pt')
 
             trainer.log_metrics("train", metrics)
             trainer.save_metrics("train", metrics)
@@ -324,9 +331,12 @@ class funcs():
         
         if do_eval:
             latest_checkpoint = '/public/home/gongzhichen/code/ProteinDevelopability/esm150m-finetuned-localization/checkpoint-89'
-            model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, num_labels=1, ignore_mismatched_sizes=True)
+            # model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint, num_labels=1, ignore_mismatched_sizes=True)
             
-            # model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
+            model = develop_esm(cfg=None, config_path=f'{model_checkpoint}/config.json', pretrained_path=model_checkpoint)
+            model.load_state_dict(torch.load(f'{model_name}-finetuned-localization/pytorch_model.pt'))
+            model.eval()
+
             
             args = TrainingArguments(
                 f"{model_name}-finetuned-localization",
@@ -335,7 +345,7 @@ class funcs():
                 learning_rate=2e-5, 
                 per_device_train_batch_size=batch_size,
                 per_device_eval_batch_size=batch_size,
-                num_train_epochs=400,
+                num_train_epochs=500,
                 weight_decay=0.01,
                 load_best_model_at_end=True,
                 metric_for_best_model="mse",
@@ -375,7 +385,7 @@ class funcs():
             
             predictions = trainer.predict(test_dataset=test_dataset)
             print(predictions)
-            
+            print('All done!')
 
         # Prediction
         # if training_args.do_predict:
@@ -402,6 +412,6 @@ class funcs():
 
 if __name__ == '__main__':
     can_do = funcs()
-    can_do.get_embedding()
+    can_do.get_embedding_all()
     
     # can_do.train_pipeline()

@@ -27,6 +27,7 @@ if __name__ == '__main__':
     pca = PCA(n_components=2)
     x_pca = pca.fit_transform(x_std)
     
+    
 
     X_pca = np.vstack((x_pca.T, np.concatenate((train_y, valid_y, test_y), axis=0))).T
     X_pca = pd.DataFrame(X_pca, columns=['PC1', 'PC2', 'label'])

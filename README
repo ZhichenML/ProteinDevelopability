@@ -2,11 +2,10 @@
 1. custom model in trainer (Done) 
 2. visualize train-validation-test loss during training (maybe by callback)
 3. compare test prediction and actual values (Done)
-4. save esm2 representations, and use ML model to predict protein developability, SVM, LR, DT (doing)
-
-
-variants:
-
-1. 3D structure info
-2. h- l- chain encoding
-3. 蛋白质频谱图(MLTO)
+4. save esm2 representations, and use ML model to predict protein developability, SVM, LR, DT (done)
+5. 2. h- l- chain encoding (Done)
+6. cluster-wise prediction (doing)
+7. 3D structure info
+8. 蛋白质频谱图(MLTO)
+10.other antibody dataset
+11. 

@@ -15,9 +15,7 @@ from datasets import Dataset, load_dataset
 from evaluate import load
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, explained_variance_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
-from tdc.single_pred import Develop
-from tdc.utils import load as data_load
-from tdc.utils import retrieve_label_name_list
+
 from transformers import (AutoModel, AutoModelForSequenceClassification,
                           AutoTokenizer, BertModel, BertTokenizer,
                           EarlyStoppingCallback, Trainer, TrainingArguments,
@@ -31,6 +29,8 @@ logger = logging.get_logger(__name__)
 import torch
 from torch import nn
 from transformers import Trainer
+
+from data import load_and_process_data
 
 set_seed(42)
 
@@ -67,30 +67,6 @@ def compute_metrics(eval_pred):
     evs = explained_variance_score(labels, predictions)
     return {"mse": mse, 'r2': r2,'mae': mae, 'evs': evs}
 
-def load_and_process_data(path='/public/home/gongzhichen/data', name = 'tap'):
-    label_list = retrieve_label_name_list('TAP')
-    print('labels for multi-target: ', label_list)
-
-    df = data_load.pd_load(name, path)
-    df = df.dropna() 
-    df2 = df.loc[:, ~df.columns.duplicated()]  ### remove the duplicate columns
-    df = df2
-    
-    for ind in range(len(df)):
-        v = df.loc[ind,'X']
-        v = v.strip('[\']').split('\\n')
-        v[0] = v[0].strip("'")
-        v[1] = v[1].strip(" '")
-        v = v[0] + v[1]
-        df.loc[ind,'X'] = v
-    
-    sequences = df['X'].tolist()
-    labels = df[label_list[0]].tolist()
-    labels = [float(v) for v in labels]
-    assert len(sequences) == len(labels)
-
-    
-    return sequences, labels
 
 def Kfold_split(train_sequences, train_labels):
     # 存储每个 fold 的训练和验证集
@@ -187,41 +163,59 @@ class get_esm_output():
                                                           )
         self.tokenizer_ = AutoTokenizer.from_pretrained(model_checkpoint)
     
-    def transform_all(self, sequences, labels):
-        embedding = self.get(sequences)
+    def transform_all(self, sequences, labels, name='tap'):
+        embedding = self.get_cls(sequences)
         tap = {'X': embedding, 'Y': labels}
-        np.savez('/public/home/gongzhichen/code/data/tap_nosplit.npz', **tap)
+        np.savez('/public/home/gongzhichen/code/data/'+ name +'_nosplit.npz', **tap)
         
     def transform(self, train_sequences, valid_sequences, test_sequences, train_labels, valid_labels, test_labels):
-        
-        train_embedding = self.get(train_sequences)
-        valid_embedding = self.get(valid_sequences)
-        test_embedding = self.get(test_sequences)
+        # will be deprecated
+        train_embedding = self.get_cls(train_sequences)
+        valid_embedding = self.get_cls(valid_sequences)
+        test_embedding = self.get_cls(test_sequences)
         tap = {'train_X': train_embedding, 'train_Y': train_labels, 'valid_X': valid_embedding, 'valid_Y': valid_labels, 'test_X': test_embedding, 'test_Y': test_labels}
         np.savez('/public/home/gongzhichen/code/data/tap.npz', **tap)
     
-    def get(self, seq_list):
+    def get_cls(self, seq_tuple):
+        sequences, h_chain, l_chain = seq_tuple
         ret = []        
-        for seq in seq_list:
-            token_seq = self.tokenizer_(seq, return_tensors='pt')
-            outputs_ = self.pretrained_model(**token_seq)
-            ret.append(outputs_.last_hidden_state[:,0,:].detach().numpy().squeeze())  ##这是获取得到的 cls 蛋白整体代表的向量
+        for seq_h, seq_l in zip(h_chain, l_chain):
+            token_seq_h = self.tokenizer_(seq_h, return_tensors='pt')
+            token_seq_l = self.tokenizer_(seq_l, return_tensors='pt')
+            outputs_h = self.pretrained_model(**token_seq_h)
+            outputs_l = self.pretrained_model(**token_seq_l)
+            outputs_h = outputs_h.last_hidden_state[:,0,:].detach().numpy().squeeze()
+            outputs_l = outputs_l.last_hidden_state[:,0,:].detach().numpy().squeeze()
+            ret.append(np.concatenate((outputs_h, outputs_l)))  ##这是获取得到的 cls 蛋白整体代表的向量
         return np.array(ret)
     
+    def get_seq(self, seq_tuple):
+        sequences, h_chain, l_chain = seq_tuple
+        ret = []        
+        for seq_h, seq_l in zip(h_chain, l_chain):
+            token_seq_h = self.tokenizer_(seq_h, return_tensors='pt')
+            token_seq_l = self.tokenizer_(seq_l, return_tensors='pt')
+            outputs_h = self.pretrained_model(**token_seq_h)
+            outputs_l = self.pretrained_model(**token_seq_l)
+            outputs_h = outputs_h.last_hidden_state.detach().numpy().squeeze().T
+            outputs_l = outputs_l.last_hidden_state.detach().numpy().squeeze().T
+            ret.append(np.concatenate((outputs_h, outputs_l), 1))  ##这是获取得到的 cls 蛋白整体代表的向量
+        
+        return np.array(ret)
+
 class funcs():
     def __init__(self):
         pass
 
-    def get_embedding_all(self):
-        model_checkpoint = '/public/home/gongzhichen/hf_models/esm3b'
-        sequences, labels = load_and_process_data()
-
+    def get_embedding_all(self, name='tap'):
+        print(f'start get_embedding_all, data_name: {name}')
         generator = get_esm_output(model_checkpoint)
-        generator.transform_all(sequences, labels)
+        generator.transform_all(sequences, labels, name=name)
+        print(f'end get_embedding_all {name}')
 
     def get_embedding(self):
-        model_checkpoint = '/public/home/gongzhichen/hf_models/esm3b'
-        sequences, labels = load_and_process_data()
+        
+  
         
         train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
         train_sequences, valid_sequences, train_labels, valid_labels = train_test_split(train_val_sequences, train_val_labels, test_size=0.1, shuffle=True)
@@ -230,10 +224,10 @@ class funcs():
         generator.transform(train_sequences, valid_sequences, test_sequences, train_labels, valid_labels, test_labels)
         
     def train_pipeline(self):
-        model_checkpoint = '/public/home/gongzhichen/hf_models/esm3b'
+        
         tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-        sequences, labels = load_and_process_data()
+  
         
         train_val_sequences, test_sequences, train_val_labels, test_labels = train_test_split(sequences, labels, test_size=0.2, shuffle=True)
         train_sequences, valid_sequences, train_labels, valid_labels = train_test_split(train_val_sequences, train_val_labels, test_size=0.1, shuffle=True)
@@ -411,7 +405,13 @@ class funcs():
 
 
 if __name__ == '__main__':
+    model_checkpoint = '/public/home/gongzhichen/hf_models/esm150m'
+    data_path='/public/home/gongzhichen/code/data'
+    data_name = 'tap' #'sabdab_chen'
+    sequences, labels = load_and_process_data(path=data_path, name = data_name, label_ind=0)
+    
     can_do = funcs()
-    can_do.get_embedding_all()
+    
+    can_do.get_embedding_all(name=data_name)
     
     # can_do.train_pipeline()

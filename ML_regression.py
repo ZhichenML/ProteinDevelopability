@@ -90,6 +90,14 @@ def train_and_test(model, device, train_loader, test_loader, optimizer, criterio
         test_loss = test_model(model, device, test_loader, criterion)
         print('Epoch: {} \tTrain Loss: {:.6f} \tTest Loss: {:.4f}'.format(epoch, train_loss, test_loss))
 
+def train_valid_test(model, device, train_loader, valid_loader, test_loader, optimizer, criterion, num_epochs):
+    for epoch in range(num_epochs):
+        train_loss = train_model(model, device, train_loader, optimizer, criterion)
+        valid_loss = test_model(model, device, valid_loader, criterion)
+        print('Epoch: {} \tTrain Loss: {:.6f} \tValid Loss: {:.4f}'.format(epoch, train_loss, valid_loss))
+        test_loss, accuracy, precision, recall, f1, r2, auc = evaluate_model_cls(model, device, test_loader, criterion)
+        print('test_loss: {}, accuracy: {}, precision: {}, recall: {}, f1: {}, r2: {}, auc: {}'.format(test_loss, accuracy, precision, recall, f1, r2, auc))
+
 def train_and_test_with_early_stopping(model, device, train_loader, test_loader, optimizer, criterion, num_epochs):
     test_loss_history = []
     for epoch in range(num_epochs):
@@ -153,12 +161,20 @@ def evaluate_model_cls(model, device, test_loader, criterion):
     auc = roc_auc_score(y_true, y_pred)
     return test_loss, accuracy, precision, recall, f1, r2, auc
 
+def re_balance(X, y, random_state=42):
+    from imblearn.over_sampling import RandomOverSampler, SMOTE, ADASYN
+    ros = ADASYN(random_state=random_state)
+    X_resampled, y_resampled = ros.fit_resample(X, y)
+    return X_resampled, y_resampled
 
 def split_data(X, y, valid_size=0.1, test_size=0.2, random_state=42):
     train_valid_X, test_X, train_valid_y, test_y = train_test_split(X, y, test_size=test_size, random_state=random_state)
+    train_valid_X, train_valid_y = re_balance(train_valid_X, train_valid_y)
     train_X, valid_X, train_y, valid_y = train_test_split(train_valid_X, train_valid_y, test_size=valid_size, random_state=random_state)
 
     return train_X, valid_X, test_X, train_y, valid_y, test_y
+
+
 
 def load_data(data_path='/public/home/gongzhichen/code/data/tap_nosplit.npz'):
     data = np.load(data_path, allow_pickle=True)
@@ -168,7 +184,9 @@ def load_data(data_path='/public/home/gongzhichen/code/data/tap_nosplit.npz'):
 
     pca = PCA(n_components=0.95)
     sequences = pca.fit_transform(sequences)
+    
     train_X, valid_X, test_X, train_y, valid_y, test_y = split_data(sequences, labels)
+    
 
     return train_X, valid_X, test_X, train_y, valid_y, test_y
 
@@ -225,6 +243,7 @@ class cnn_model(nn.Module):
         x = x.view(x.size(0), -1)
         x = self.fc1(x)
         x = nn.functional.relu(x)
+        x = self.fc2(x)
         return x
 
 def run_cnn(data_path, input_size, hidden_size, lr, batch_size, num_epochs):
@@ -303,7 +322,7 @@ def run_dt(data_path, max_depth=None, min_samples_split=2, min_samples_leaf=1):
 
 
 if __name__ == '__main__':
-    run_cnn('/public/home/gongzhichen/code/data/sabdab_chen_nosplit.npz', 928, 128, 2e-5, 512, 100)
+    run_cnn('/public/home/gongzhichen/code/data/sabdab_chen_nosplit.npz', 928, 128, 2e-5, 512, 700)
     # run_ml('/public/home/gongzhichen/code/data/tap_nosplit.npz', 76, 128, 2e-5, 512, 5000)
     # run_svm('/public/home/gongzhichen/code/data/tap_nosplit.npz', kernel='linear', C=1.0)
     # run_rf('/public/home/gongzhichen/code/data/tap_nosplit.npz', n_estimators=50, max_depth=None, min_samples_split=2, min_samples_leaf=1, max_samples=None)
